@@ -1,0 +1,12 @@
+{
+    "name": "pmu-simulator",
+    "version": "1.0.0",
+    "description": "MQTT Simulator for Industrial Power Meter Dashboard",
+    "main": "simulate.js",
+    "scripts": {
+        "start": "node simulate.js"
+    },
+    "dependencies": {
+        "mqtt": "^5.3.4"
+    }
+}
