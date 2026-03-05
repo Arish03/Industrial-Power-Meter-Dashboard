@@ -10,6 +10,7 @@ const Telemetry = require("./models/Telemetry");
 const Status = require("./models/Status");
 const Alarm = require("./models/Alarm");
 const Info = require("./models/Info");
+const Config = require("./models/Config");
 const apiRoutes = require("./routes/api");
 
 // ─── Express + HTTP + Socket.IO Setup ────────────────────────────────────────
@@ -44,6 +45,98 @@ mongoose
     .connect(MONGODB_URI)
     .then(() => console.log("✅ MongoDB connected:", MONGODB_URI))
     .catch((err) => console.error("❌ MongoDB error:", err.message));
+
+// ─── MQTT Threshold Alarm Engine ──────────────────────────────────────────
+
+let alarmThresholds = {
+    warn_pf: 0.90, crit_pf: 0.85,
+    warn_thd_v: 5.0, crit_thd_v: 8.0,
+    warn_v_dev_pct: 10.0, crit_v_dev_pct: 15.0,
+    warn_i_a: 40.0, crit_i_a: 50.0,
+    warn_freq_dev: 0.5, crit_freq_dev: 1.0,
+    nominalV: 230, nominalFreq: 50
+};
+
+// Site-asset specific cooldowns to prevent alarm flapping
+const activeAlarms = new Map();
+const ALARM_COOLDOWN = 60 * 1000; // 1 minute cooldown
+
+async function loadThresholds() {
+    try {
+        const config = await Config.findOne().lean();
+        if (config) {
+            alarmThresholds = { ...alarmThresholds, ...config };
+            ["warn_pf", "crit_pf", "warn_thd_v", "crit_thd_v", "warn_v_dev_pct", "crit_v_dev_pct", "warn_i_a", "crit_i_a", "warn_freq_dev", "crit_freq_dev", "nominalV", "nominalFreq"].forEach(k => {
+                if (alarmThresholds[k] != null) alarmThresholds[k] = parseFloat(alarmThresholds[k]);
+            });
+        }
+    } catch (err) { console.error("Error loading thresholds:", err.message); }
+}
+
+loadThresholds();
+setInterval(loadThresholds, 30000);
+
+async function processThresholdAlarms(site_id, asset_id, payload) {
+    if (!payload?.elec) return;
+    const { elec, pq } = payload;
+    const { pf_total, freq_hz, v_ln_rms, i_rms } = elec;
+    const thd_v = pq?.thd_v_pct_est;
+    const checks = [];
+
+    if (pf_total != null) {
+        if (pf_total < alarmThresholds.crit_pf) checks.push({ code: "CRIT_LOW_PF", msg: `Critical: PF is ${pf_total.toFixed(3)} (threshold ${alarmThresholds.crit_pf})`, severity: "critical" });
+        else if (pf_total < alarmThresholds.warn_pf) checks.push({ code: "WARN_LOW_PF", msg: `Warning: PF is ${pf_total.toFixed(3)} (threshold ${alarmThresholds.warn_pf})`, severity: "warning" });
+    }
+    if (thd_v != null) {
+        if (thd_v > alarmThresholds.crit_thd_v) checks.push({ code: "CRIT_HIGH_THD_V", msg: `Critical: THD-V is ${thd_v.toFixed(1)}% (limit ${alarmThresholds.crit_thd_v}%)`, severity: "critical" });
+        else if (thd_v > alarmThresholds.warn_thd_v) checks.push({ code: "WARN_HIGH_THD_V", msg: `Warning: THD-V is ${thd_v.toFixed(1)}% (limit ${alarmThresholds.warn_thd_v}%)`, severity: "warning" });
+    }
+    if (v_ln_rms) {
+        const nominalV = alarmThresholds.nominalV || 230;
+        const wTol = (alarmThresholds.warn_v_dev_pct || 10) / 100;
+        const cTol = (alarmThresholds.crit_v_dev_pct || 15) / 100;
+        ["A", "B", "C"].forEach(ph => {
+            const v = v_ln_rms[ph];
+            if (v != null) {
+                if (v < nominalV * (1 - cTol) || v > nominalV * (1 + cTol)) {
+                    checks.push({ code: "CRIT_VOLTAGE_ANOMALY", msg: `Critical: Phase ${ph} voltage is ${v.toFixed(1)}V (nominal ${nominalV}V ±${alarmThresholds.crit_v_dev_pct}%)`, severity: "critical" });
+                } else if (v < nominalV * (1 - wTol) || v > nominalV * (1 + wTol)) {
+                    checks.push({ code: "WARN_VOLTAGE_ANOMALY", msg: `Warning: Phase ${ph} voltage is ${v.toFixed(1)}V (nominal ${nominalV}V ±${alarmThresholds.warn_v_dev_pct}%)`, severity: "warning" });
+                }
+            }
+        });
+    }
+    if (i_rms) {
+        const wLimit = alarmThresholds.warn_i_a || 40;
+        const cLimit = alarmThresholds.crit_i_a || 50;
+        ["A", "B", "C"].forEach(ph => {
+            const i = i_rms[ph];
+            if (i != null) {
+                if (i > cLimit) checks.push({ code: "CRIT_OVERCURRENT", msg: `Critical: Phase ${ph} current is ${i.toFixed(1)}A (limit ${cLimit}A)`, severity: "critical" });
+                else if (i > wLimit) checks.push({ code: "WARN_OVERCURRENT", msg: `Warning: Phase ${ph} current is ${i.toFixed(1)}A (limit ${wLimit}A)`, severity: "warning" });
+            }
+        });
+    }
+    if (freq_hz != null) {
+        const nominalF = alarmThresholds.nominalFreq || 50;
+        const dev = Math.abs(freq_hz - nominalF);
+        if (dev > alarmThresholds.crit_freq_dev) checks.push({ code: "CRIT_FREQ_DRIFT", msg: `Critical: Frequency is ${freq_hz.toFixed(2)}Hz (nominal ${nominalF}Hz ±${alarmThresholds.crit_freq_dev}Hz)`, severity: "critical" });
+        else if (dev > alarmThresholds.warn_freq_dev) checks.push({ code: "WARN_FREQ_DRIFT", msg: `Warning: Frequency is ${freq_hz.toFixed(2)}Hz (nominal ${nominalF}Hz ±${alarmThresholds.warn_freq_dev}Hz)`, severity: "warning" });
+    }
+
+    for (const check of checks) {
+        const alarmKey = `${site_id}:${asset_id}:${check.code}`;
+        const now = Date.now();
+        if (!activeAlarms.has(alarmKey) || (now - activeAlarms.get(alarmKey)) > ALARM_COOLDOWN) {
+            try {
+                const doc = await Alarm.create({ ...check, site_id, asset_id });
+                io.emit("alarm", doc.toObject());
+                console.log(`🚨 Alarm [AUTO] | ${site_id}/${asset_id} | ${check.code}: ${check.msg}`);
+                activeAlarms.set(alarmKey, now);
+            } catch (err) { console.error("Failed to store auto-alarm:", err.message); }
+        }
+    }
+}
 
 // ─── MQTT Client ─────────────────────────────────────────────────────────────
 const MQTT_BROKER_URL = process.env.MQTT_BROKER_URL || "mqtt://localhost:1883";
@@ -81,6 +174,34 @@ mqttClient.on("offline", () => {
     console.warn("⚠️  MQTT broker offline");
 });
 
+// ─── Device Timeout Tracking ──────────────────────────────────────────────────
+const deviceTimeouts = {};
+
+function resetDeviceTimeout(site_id, asset_id) {
+    const key = `${site_id}/${asset_id}`;
+
+    // Clear existing timeout if it exists
+    if (deviceTimeouts[key]) {
+        clearTimeout(deviceTimeouts[key]);
+    }
+
+    // Set a new timeout for 10 seconds
+    deviceTimeouts[key] = setTimeout(async () => {
+        console.log(`⚠️  Device Timeout | ${site_id}/${asset_id} | State: offline`);
+        try {
+            const doc = await Status.create({
+                site_id,
+                asset_id,
+                state: "offline",
+                ts_ms: Date.now()
+            });
+            io.emit("status", doc.toObject());
+        } catch (err) {
+            console.error("❌ Failed to log offline status:", err.message);
+        }
+    }, 10000);
+}
+
 // ─── MQTT Message Handler ─────────────────────────────────────────────────────
 mqttClient.on("message", async (topic, message) => {
     let payload;
@@ -97,6 +218,9 @@ mqttClient.on("message", async (topic, message) => {
 
     const [, site_id, asset_id, messageType] = parts;
 
+    // Any valid message resets the device's online timeout
+    resetDeviceTimeout(site_id, asset_id);
+
     try {
         switch (messageType) {
             case "telemetry": {
@@ -106,7 +230,24 @@ mqttClient.on("message", async (topic, message) => {
                     asset_id,
                 });
                 io.emit("telemetry", doc.toObject());
-                console.log(`📊 Telemetry | ${site_id}/${asset_id} | P: ${payload?.elec?.p_kw?.total ?? "?"}kW`);
+
+                // Process server-side thresholds
+                processThresholdAlarms(site_id, asset_id, payload);
+
+                // If we get telemetry, also assure device is marked online
+                const statusDoc = await Status.create({
+                    site_id,
+                    asset_id,
+                    state: "online",
+                    ts_ms: Date.now()
+                });
+                io.emit("status", statusDoc.toObject());
+
+                // Keep telemetry log clean
+                // console.log(`📊 Telemetry | ${site_id}/${asset_id} | P: ${payload?.elec?.p_kw?.total ?? "?"}kW`);
+
+                // Process server-side thresholds
+                processThresholdAlarms(site_id, asset_id, payload);
                 break;
             }
 
