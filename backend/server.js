@@ -11,6 +11,7 @@ const Status = require("./models/Status");
 const Alarm = require("./models/Alarm");
 const Info = require("./models/Info");
 const apiRoutes = require("./routes/api");
+const chatRoutes = require("./routes/chat");
 
 // ─── Express + HTTP + Socket.IO Setup ────────────────────────────────────────
 const app = express();
@@ -27,6 +28,8 @@ app.use(express.json());
 
 // ─── REST API Routes ──────────────────────────────────────────────────────────
 app.use("/api", apiRoutes);
+app.use("/api/chat", chatRoutes);
+
 
 // Health check
 app.get("/health", (req, res) => {
