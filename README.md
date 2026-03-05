@@ -384,7 +384,7 @@ node simulate.js # Start simulator (Ctrl+C to stop)
 **Arish**  
 IoT & Full-Stack Developer · LANSUB Technologies
 
-- 🐙 GitHub: [@arish](https://github.com/arish)
+- 🐙 GitHub: [@arish](https://github.com/Arish03)
 - 📧 Email: arish@lansub.com
 - 🏢 Project: Industrial Power Meter Dashboard (IPMD)
 
