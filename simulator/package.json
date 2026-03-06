@@ -7,6 +7,9 @@
         "start": "node simulate.js"
     },
     "dependencies": {
-        "mqtt": "^5.3.4"
-    }
+        "mqtt": "^5.15.0"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC"
 }
